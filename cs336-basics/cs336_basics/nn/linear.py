@@ -24,4 +24,4 @@ class Linear(nn.Module):
         self.W = nn.Parameter(w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return einsum(x, self.W, "... in, out in -> ... out")
+        return einsum(x, self.W, "... d_in, d_out d_in -> ... d_out")
