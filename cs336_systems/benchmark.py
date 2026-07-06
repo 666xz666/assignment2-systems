@@ -1,12 +1,27 @@
+# 覆盖添加注解
+from cs336_systems.annotated import ScaledDotProductAttention
+import cs336_basics.nn.scaled_dot_product_attention as sdpa
+
+sdpa.ScaledDotProductAttention = ScaledDotProductAttention
+# 强制重载多头注意力模块，刷新内部缓存的类引用
+import cs336_basics.nn.multihead_self_attention
+import importlib
+
+importlib.reload(cs336_basics.nn.multihead_self_attention)
+
+# 库依赖
 import torch
 import timeit
 from typing import Callable, List, Dict
 import math
 import pandas as pd
 import os
+import torch.cuda.nvtx as nvtx
 
+# 作业一实现
 from cs336_basics.nn import TransformerLM
 from cs336_basics.utils import try_gpu, cross_entropy
+from cs336_basics.optim import AdamW
 
 
 class Timer:
@@ -60,60 +75,62 @@ def init_model(
 def generate_random_data(
     batch_size: int, context_len: int, d_model: int, vocab_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Generate a random batch of data.
-    """
     dv = try_gpu()
     x = torch.randint(
-        low=0,
-        high=vocab_size - 1,
-        size=(batch_size, context_len),
-        dtype=torch.long,
-        device=dv,
+        0, vocab_size, size=(batch_size, context_len), dtype=torch.long, device=dv
     )
     y = torch.randint(
-        low=0,
-        high=vocab_size - 1,
-        size=(batch_size, context_len),
-        dtype=torch.long,
-        device=dv,
+        0, vocab_size, size=(batch_size, context_len), dtype=torch.long, device=dv
     )
     return x, y
 
 
-def benchmark(
+def benchmark_full(
     warm_up_steps: int,
     num_steps: int,
     forward_step: Callable,
     backward_step: Callable,
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    """
-    Run w warm-up steps (before you start measuring time), then time the execution of n  steps (either only forward, forward and backward, or forward and backward with optimizer step, depending on an argument).
-    """
-    # warm up
-    for _ in range(warm_up_steps):
-        # 消除算子编译时间开销
-        out = forward_step()
-        backward_step(out)
-    torch.cuda.synchronize()  # 等待所有cuda异步线程完成
+    train_step: Callable,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    # 预热整体NVTX标记，nsys可过滤掉预热
+    with nvtx.range(f"Warmup_{warm_up_steps}_Steps"):
+        for _ in range(warm_up_steps):
+            out = forward_step()
+            backward_step(out)
+            train_step()
+    torch.cuda.synchronize()
 
-    # 正式计数
     f_times = []
     b_times = []
-    for _ in range(num_steps):
-        # 单独计时前向
-        with Timer() as t_f:
-            out = forward_step()
-        f_times.append(t_f.cost)
+    opt_times = []
 
-        # 复用前向输出，单独计时反向
-        with Timer() as t_b:
-            backward_step(out)
-        b_times.append(t_b.cost)
+    # 测量总区间
+    with nvtx.range(f"Measurement_{num_steps}_Iter"):
+        for _ in range(num_steps):
+            # 单独标记前向
+            with nvtx.range("ForwardPass"):
+                with Timer() as t_f:
+                    out = forward_step()
+                f_times.append(t_f.cost)
+
+            # 单独标记反向
+            with nvtx.range("BackwardPass"):
+                with Timer() as t_b:
+                    backward_step(out)
+                b_times.append(t_b.cost)
+
+            # 完整训练步：前向+反向+优化器（用于题目d）
+            with nvtx.range("FullTrainStep_ForwardBackward_Optimizer"):
+                with Timer() as t_opt:
+                    o = forward_step()
+                    backward_step(o)
+                    train_step()
+                opt_times.append(t_opt.cost)
 
     f_mean, f_std = mean(f_times), std_sample(f_times)
     b_mean, b_std = mean(b_times), std_sample(b_times)
-    return (f_mean, f_std), (b_mean, b_std)
+    opt_mean, opt_std = mean(opt_times), std_sample(opt_times)
+    return (f_mean, f_std), (b_mean, b_std), (opt_mean, opt_std)
 
 
 default_hyper_params = {"vocab_size": 10_000, "batch_size": 4, "context_length": 512}
@@ -133,7 +150,6 @@ model_sizes = [
 
 
 def single_model_bench(cfg, warm_up_steps):
-    """单模型执行测速，返回(前向均值std, 反向均值std)"""
     model = init_model(
         vocab_size=default_hyper_params["vocab_size"],
         context_length=default_hyper_params["context_length"],
@@ -149,6 +165,9 @@ def single_model_bench(cfg, warm_up_steps):
         d_model=cfg["d_model"],
         vocab_size=default_hyper_params["vocab_size"],
     )
+    opt = AdamW(
+        model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01
+    )
 
     def forward_step() -> torch.Tensor:
         return model(x)
@@ -158,31 +177,30 @@ def single_model_bench(cfg, warm_up_steps):
         loss = cross_entropy(out, y)
         loss.backward()
 
-    f_res, b_res = benchmark(
+    def train_step():
+        opt.step()
+
+    f_res, b_res, opt_res = benchmark_full(
         warm_up_steps=warm_up_steps,
         num_steps=10,
         forward_step=forward_step,
         backward_step=backward_step,
+        train_step=train_step,
     )
-    # 释放显存，避免下一个模型OOM
-    del model, x, y
+    del model, x, y, opt
     torch.cuda.empty_cache()
-    return f_res, b_res
+    return f_res, b_res, opt_res
 
 
 def run_benchmark():
-    """
-    同时测试 0 / 2 / 5 轮预热，保存全部结果用于对比
-    Use w warmup steps and compute the average and standard deviation of timings over 10 measurement steps. How long does a forward pass take? How about a backward pass?
-    """
     res_list: List[Dict] = []
-    # 三组预热配置
-    warmup_configs = [0, 2, 5]
+    # warmup_configs = [0, 2, 5] # 测试不warm up、warm up 1-2步
+    warmup_configs = [5]
 
     for warmup in warmup_configs:
         print(f"===== Running warm_up_steps = {warmup} =====")
         for cfg in model_sizes:
-            f_res, b_res = single_model_bench(cfg, warm_up_steps=warmup)
+            f_res, b_res, opt_res = single_model_bench(cfg, warm_up_steps=warmup)
             row = {
                 "warmup_steps": warmup,
                 "Size": cfg["size"],
@@ -190,6 +208,8 @@ def run_benchmark():
                 "Tf_std": f_res[1],
                 "Tb_mean": b_res[0],
                 "Tb_std": b_res[1],
+                "Topt_mean": opt_res[0],
+                "Topt_std": opt_res[1],
             }
             res_list.append(row)
 
@@ -205,5 +225,14 @@ def run_benchmark():
 OUT_DIR = "./output/benchmark"
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
-    # run benchmark
+
     run_benchmark()
+
+
+"""
+uv run nsys profile \
+--trace=cuda,cudnn,cublas,osrt,nvtx \
+--pytorch=functions-trace,autograd-shapes-nvtx \
+-o ./output/nsys/benchmark.nsys-rep \
+-- python cs336_systems/benchmark.py
+"""
