@@ -35,7 +35,6 @@ python-preference = "managed"
 cs336-basics = { path = "./cs336-basics", editable = true } # Change this path to your assignment1-basics repo you want to use your own implementation!
 
 
-
 [tool.pytest.ini_options]
 log_cli = true
 log_cli_level = "WARNING"
@@ -47,12 +46,11 @@ filterwarnings = [
 ]
 
 [tool.ruff]
-line-length = 180
-
-[tool.ruff.lint.extend-per-file-ignores]
-# Also ignore `E402` in all `__init__.py` files.
-"__init__.py" = ["E402", "F401", "F403", "E501"]
+line-length = 88
+# 排除目录，避免扫描虚拟环境、缓存
+exclude = [".venv", "__pycache__", "build", "dist", ".git"]
 
 [tool.ruff.lint]
-extend-select = ["UP"]
-ignore = ["F722"]
+select = []
+extend-select = []
+ignore = []
