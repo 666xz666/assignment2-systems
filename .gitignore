@@ -166,3 +166,4 @@ cython_debug/
 output/
 .vscode/
 *.nsys-rep
+_cs336-basics/

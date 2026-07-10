@@ -194,7 +194,8 @@ ALL_MODEL_SIZES = [
         "num_heads": 16,
     },
     {"size": "large", "d_model": 1280, "d_ff": 5120, "num_layers": 36, "num_heads": 20},
-    {"size": "xl", "d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32},
+    # {"size": "xl", "d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32},
+    {"size": "xl", "d_model": 1600, "d_ff": 6400, "num_layers": 48, "num_heads": 25},
     {"size": "10B", "d_model": 4608, "d_ff": 12288, "num_layers": 50, "num_heads": 36},
 ]
 
