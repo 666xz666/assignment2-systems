@@ -1,0 +1,3 @@
+[submodule "cs336-basics"]
+	path = cs336-basics
+	url = https://github.com/666xz666/assignment1-basics.git
