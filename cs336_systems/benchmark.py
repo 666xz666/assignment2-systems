@@ -19,6 +19,9 @@ import os
 import torch.cuda.nvtx as nvtx
 import argparse
 
+# 导入autocast
+from torch import autocast
+
 # 作业一实现
 from cs336_basics.nn import TransformerLM
 from cs336_basics.utils import try_gpu, cross_entropy
@@ -71,7 +74,7 @@ def build_config_tag(
     # 预热步数：多个用短横线连接
     warm_str = "-".join(str(w) for w in warmup_steps)
     parts.append(f"warm{warm_str}")
-    # 计算精度（预留混合精度扩展位）
+    # 计算精度（fp32 / bf16）
     parts.append(dtype)
     # 运行模式
     parts.append(run_mode)
@@ -88,8 +91,8 @@ def init_model(
     num_heads: int,
     d_ff: int,
     rope_theta: float | None = 10_000.0,
-    dtype: torch.dtype = torch.float32,
 ) -> TransformerLM:
+    # 固定模型权重永远初始化 FP32，autocast 只控制中间激活，不修改参数存储类型
     model = TransformerLM(
         vocab_size=vocab_size,
         context_length=context_length,
@@ -99,7 +102,7 @@ def init_model(
         d_ff=d_ff,
         theta=rope_theta,
         device=try_gpu(),
-        dtype=dtype,
+        dtype=torch.float32,
     )
     return model
 
@@ -194,8 +197,8 @@ ALL_MODEL_SIZES = [
         "num_heads": 16,
     },
     {"size": "large", "d_model": 1280, "d_ff": 5120, "num_layers": 36, "num_heads": 20},
-    # {"size": "xl", "d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32},
-    {"size": "xl", "d_model": 1600, "d_ff": 6400, "num_layers": 48, "num_heads": 25},
+    {"size": "xl", "d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32},
+    # {"size": "xl", "d_model": 1600, "d_ff": 6400, "num_layers": 48, "num_heads": 25},
     {"size": "10B", "d_model": 4608, "d_ff": 12288, "num_layers": 50, "num_heads": 36},
 ]
 
@@ -209,7 +212,7 @@ def single_model_bench(
     run_mode: str,
     enable_mem_profile: bool,
     snapshot_root_dir: str,
-    dtype: torch.dtype = torch.float32,
+    amp_enable: bool,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
     model = init_model(
         vocab_size=vocab_size,
@@ -219,7 +222,6 @@ def single_model_bench(
         num_heads=cfg["num_heads"],
         d_ff=cfg["d_ff"],
         rope_theta=10_000,
-        dtype=dtype,
     )
     x, y = generate_random_data(
         batch_size=batch_size,
@@ -230,15 +232,29 @@ def single_model_bench(
         model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01
     )
 
+    # 推理模式关闭梯度
+    if run_mode == "infer":
+        model.eval()
+        torch.set_grad_enabled(False)
+    else:
+        model.train()
+        torch.set_grad_enabled(True)
+
     def forward_step() -> torch.Tensor:
-        return model(x)
+        # 开启BF16 autocast 上下文
+        with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enable):
+            return model(x)
 
     def backward_step(out: torch.Tensor):
-        model.zero_grad()
+        if run_mode == "infer":
+            return
+        model.zero_grad(set_to_none=True)
         loss = cross_entropy(out, y)
         loss.backward()
 
     def train_step():
+        if run_mode == "infer":
+            return
         opt.step()
 
     # 构造快照文件名：全局配置已在目录体现，这里仅标模型+模式
@@ -273,8 +289,7 @@ def run_benchmark(
     run_mode: str,
     enable_mem_profile: bool,
     out_dir: str,
-    dtype: torch.dtype = torch.float32,
-    dtype_name: str = "fp32",
+    amp_dtype_arg: str,
 ):
     # 筛选要跑的模型规模
     model_sizes = [cfg for cfg in ALL_MODEL_SIZES if cfg["size"] in selected_sizes]
@@ -283,6 +298,14 @@ def run_benchmark(
             f"No valid model sizes selected. Available: {[c['size'] for c in ALL_MODEL_SIZES]}"
         )
 
+    # 解析AMP配置
+    if amp_dtype_arg == "bf16":
+        amp_enable = True
+        dtype_tag = "bf16"
+    else:
+        amp_enable = False
+        dtype_tag = "fp32"
+
     # 生成全量配置标签，创建专属输出目录
     config_tag = build_config_tag(
         selected_sizes=selected_sizes,
@@ -290,7 +313,7 @@ def run_benchmark(
         batch_size=batch_size,
         vocab_size=vocab_size,
         warmup_steps=warmup_steps_list,
-        dtype=dtype_name,
+        dtype=dtype_tag,
         run_mode=run_mode,
         enable_mem_profile=enable_mem_profile,
     )
@@ -302,7 +325,7 @@ def run_benchmark(
 
     for warmup in warmup_steps_list:
         print(
-            f"===== Warmup steps = {warmup} | Mode = {run_mode} | Mem profile = {enable_mem_profile} ====="
+            f"===== Warmup steps = {warmup} | Mode = {run_mode} | AMP={dtype_tag} | Mem profile = {enable_mem_profile} ====="
         )
         for cfg in model_sizes:
             print(f"  Running model: {cfg['size']}")
@@ -315,7 +338,7 @@ def run_benchmark(
                 run_mode=run_mode,
                 enable_mem_profile=enable_mem_profile,
                 snapshot_root_dir=mem_snap_dir,
-                dtype=dtype,
+                amp_enable=amp_enable,
             )
             row = {
                 "warmup_steps": warmup,
@@ -324,7 +347,7 @@ def run_benchmark(
                 "batch_size": batch_size,
                 "context_length": context_length,
                 "run_mode": run_mode,
-                "dtype": dtype_name,
+                "amp_precision": dtype_tag,
                 "tf_mean": f_res[0],
                 "tf_std": f_res[1],
                 "tb_mean": b_res[0],
@@ -350,7 +373,7 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CS336 Assignment2 Transformer Benchmark (兼容所有子题目)"
+        description="CS336 Assignment2 Transformer Benchmark (兼容所有子题目 + BF16混合精度AMP)"
     )
 
     # 模型规模选择
@@ -393,6 +416,15 @@ def main():
         help="开启 PyTorch CUDA 内存快照导出（2.1.6 题目用）",
     )
 
+    # 新增混合精度参数
+    parser.add_argument(
+        "--amp",
+        type=str,
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help="fp32 全精度 / bf16 开启autocast混合精度，默认 fp32",
+    )
+
     # 输出目录
     parser.add_argument(
         "--out-dir",
@@ -413,6 +445,7 @@ def main():
         run_mode=args.run_mode,
         enable_mem_profile=args.memory_profile,
         out_dir=args.out_dir,
+        amp_dtype_arg=args.amp,
     )
 
 
@@ -421,18 +454,20 @@ if __name__ == "__main__":
 
 
 """
-# nsys  profiling 示例（输出路径同步带配置标识）
-uv run nsys profile \
---trace=cuda,cudnn,cublas,osrt,nvtx \
---pytorch=functions-trace,autograd-shapes-nvtx \
--o ./output/benchmark/model_xl_ctx1024_bs4_vocab10k_warm5_fp32_train_mem0/nsys_trace \
--- python cs336_systems/benchmark.py \
---model-sizes xl \
---context-length 1024
-
-python cs336_systems/benchmark.py \
+uv run python cs336_systems/benchmark.py \
 --model-sizes xl \
 --context-length 128 \
 --run-mode infer \
+--amp bf16 \
 --memory-profile
+
+# nsys  profiling 示例（输出路径自动携带amp标识）
+uv run nsys profile \
+--trace=cuda,cudnn,cublas,osrt,nvtx \
+--pytorch=functions-trace,autograd-shapes-nvtx \
+-o ./output/benchmark/xxx/nsys_trace \
+-- python cs336_systems/benchmark.py \
+--model-sizes xl \
+--context-length 1024 \
+--amp bf16
 """
