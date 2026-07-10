@@ -122,7 +122,9 @@ def generate_random_data(
 
 def dump_memory_snapshot(save_path: str):
     """封装 PyTorch CUDA 内存快照导出逻辑"""
-    torch.cuda.memory._record_memory_history(max_entries=1_000_000)
+    torch.cuda.memory._record_memory_history(
+        max_entries=1_000_000, context="all", stacks="all"
+    )
     torch.cuda.synchronize()
     torch.cuda.memory._dump_snapshot(save_path)
     torch.cuda.memory._record_memory_history(enabled=None)
@@ -160,8 +162,6 @@ def benchmark_full(
             with nvtx.range("ForwardPass"):
                 with Timer() as t_f:
                     out = forward_step()
-                    if capture_mem and run_mode == "infer":
-                        dump_memory_snapshot(snapshot_save_path)
                 f_times.append(t_f.cost)
 
             # 反向传播
@@ -176,8 +176,6 @@ def benchmark_full(
                     o = forward_step()
                     backward_step(o)
                     train_step()
-                    if capture_mem and run_mode == "train":
-                        dump_memory_snapshot(snapshot_save_path)
                 opt_times.append(t_opt.cost)
 
     f_mean, f_std = mean(f_times), std_sample(f_times)
@@ -214,6 +212,17 @@ def single_model_bench(
     snapshot_root_dir: str,
     amp_enable: bool,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    snapshot_path = None
+    # ========== 改动1：提前开启内存追踪，在创建任何张量之前 ==========
+    if enable_mem_profile:
+        torch.cuda.memory._record_memory_history(
+            max_entries=2_000_000, context="all", stacks="all"
+        )
+        os.makedirs(snapshot_root_dir, exist_ok=True)
+        snapshot_name = f"{cfg['size']}_{run_mode}.pickle"
+        snapshot_path = os.path.join(snapshot_root_dir, snapshot_name)
+
+    # 此时再初始化模型、数据、优化器，所有分配都会被记录
     model = init_model(
         vocab_size=vocab_size,
         context_length=context_length,
@@ -232,7 +241,7 @@ def single_model_bench(
         model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01
     )
 
-    # 推理模式关闭梯度
+    # 推理/训练模式设置不变
     if run_mode == "infer":
         model.eval()
         torch.set_grad_enabled(False)
@@ -241,7 +250,6 @@ def single_model_bench(
         torch.set_grad_enabled(True)
 
     def forward_step() -> torch.Tensor:
-        # 开启BF16 autocast 上下文
         with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enable):
             return model(x)
 
@@ -257,13 +265,6 @@ def single_model_bench(
             return
         opt.step()
 
-    # 构造快照文件名：全局配置已在目录体现，这里仅标模型+模式
-    snapshot_path = None
-    if enable_mem_profile:
-        os.makedirs(snapshot_root_dir, exist_ok=True)
-        snapshot_name = f"{cfg['size']}_{run_mode}.pickle"
-        snapshot_path = os.path.join(snapshot_root_dir, snapshot_name)
-
     f_res, b_res, opt_res = benchmark_full(
         warm_up_steps=warm_up_steps,
         num_steps=10,
@@ -274,6 +275,13 @@ def single_model_bench(
         enable_mem_profile=enable_mem_profile,
         snapshot_save_path=snapshot_path,
     )
+
+    # ========== 改动2：benchmark结束后统一dump快照，关闭记录 ==========
+    if enable_mem_profile and snapshot_path is not None:
+        torch.cuda.synchronize()
+        torch.cuda.memory._dump_snapshot(snapshot_path)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"Memory snapshot saved to {snapshot_path}")
 
     del model, x, y, opt
     torch.cuda.empty_cache()
