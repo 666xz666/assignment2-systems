@@ -91,8 +91,10 @@ def init_model(
     num_heads: int,
     d_ff: int,
     rope_theta: float | None = 10_000.0,
+    use_compile: bool = False,
+    compile_backend: str = "inductor",
+    compile_mode: str = "default",
 ) -> TransformerLM:
-    # 固定模型权重永远初始化 FP32，autocast 只控制中间激活，不修改参数存储类型
     model = TransformerLM(
         vocab_size=vocab_size,
         context_length=context_length,
@@ -104,6 +106,14 @@ def init_model(
         device=try_gpu(),
         dtype=torch.float32,
     )
+    if use_compile:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("--compile requires PyTorch 2.0 or newer")
+        model = torch.compile(
+            model,
+            backend=compile_backend,
+            mode=compile_mode,
+        )
     return model
 
 
@@ -211,6 +221,9 @@ def single_model_bench(
     enable_mem_profile: bool,
     snapshot_root_dir: str,
     amp_enable: bool,
+    use_compile: bool,
+    compile_backend: str,
+    compile_mode: str,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
     snapshot_path = None
     # ========== 改动1：提前开启内存追踪，在创建任何张量之前 ==========
@@ -231,6 +244,9 @@ def single_model_bench(
         num_heads=cfg["num_heads"],
         d_ff=cfg["d_ff"],
         rope_theta=10_000,
+        use_compile=use_compile,
+        compile_backend=compile_backend,
+        compile_mode=compile_mode,
     )
     x, y = generate_random_data(
         batch_size=batch_size,
@@ -298,6 +314,9 @@ def run_benchmark(
     enable_mem_profile: bool,
     out_dir: str,
     amp_dtype_arg: str,
+    use_compile: bool,
+    compile_backend: str,
+    compile_mode: str,
 ):
     # 筛选要跑的模型规模
     model_sizes = [cfg for cfg in ALL_MODEL_SIZES if cfg["size"] in selected_sizes]
@@ -347,6 +366,9 @@ def run_benchmark(
                 enable_mem_profile=enable_mem_profile,
                 snapshot_root_dir=mem_snap_dir,
                 amp_enable=amp_enable,
+                use_compile=use_compile,
+                compile_backend=compile_backend,
+                compile_mode=compile_mode,
             )
             row = {
                 "warmup_steps": warmup,
@@ -431,6 +453,27 @@ def main():
         choices=["fp32", "bf16"],
         default="fp32",
         help="fp32 全精度 / bf16 开启autocast混合精度，默认 fp32",
+    )
+
+    parser.add_argument(
+        "--compile",
+        "--torch-compile",
+        dest="use_compile",
+        action="store_true",
+        help="使用 torch.compile 编译完整 TransformerLM",
+    )
+
+    parser.add_argument("--compile-backend", default="inductor")
+
+    parser.add_argument(
+        "--compile-mode",
+        choices=(
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
+        default="default",
     )
 
     # 输出目录
