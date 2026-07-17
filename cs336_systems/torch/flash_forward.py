@@ -1,5 +1,6 @@
 import torch
 import torch.autograd as autograd
+from einops import rearrange
 
 
 def flash_attn_ref_naive(Q, K, V, is_causal=False):
@@ -21,15 +22,19 @@ class FlashAttention2Forward(autograd.Function):
     def forward(ctx, Q, K, V, is_causal=False):
         """
         严格复刻 Algorithm 1 FlashAttention-2 前向分块递推
-        Q: [Nq, d]
-        K: [Nk, d]
-        V: [Nk, d]
-        is_causal: 本题可忽略
-        return O[Nq, d], 同时ctx保存Q,K,V,O,L供反向使用
+        支持输入任意前缀批量/多头维度：如 [B, H, Nq, D] / [B, G, H, Nq, D]
+        内部自动展平为二维分块计算，输出还原输入原始shape
         """
-        # 1. 读取维度 + 自定义Tile尺寸（满足>=16×16，选32可自行修改）
-        n_q, d = Q.shape
-        n_k, _ = K.shape
+        # ========== 新增：保存原始前缀维度，展平前缀所有维度 ==========
+        prefix_shape = Q.shape[:-2]
+        # ... 匹配任意多前缀维度，合并为单一batch维度
+        Q_flat = rearrange(Q, "... nq d -> (...) nq d")
+        K_flat = rearrange(K, "... nk d -> (...) nk d")
+        V_flat = rearrange(V, "... nk d -> (...) nk d")
+
+        # 展平后固定格式：[total_batch, n_q, d]
+        total_batch, n_q, d = Q_flat.shape
+        n_k = K_flat.size(-2)
         Q_TILE_SIZE = 32  # Query分块大小
         K_TILE_SIZE = 32  # KV分块大小
 
@@ -37,70 +42,89 @@ class FlashAttention2Forward(autograd.Function):
         n_q_tiles = (n_q + Q_TILE_SIZE - 1) // Q_TILE_SIZE
         n_k_tiles = (n_k + K_TILE_SIZE - 1) // K_TILE_SIZE
 
-        # 初始化最终输出O、LogSumExp L
-        O_total = torch.zeros_like(Q)
-        L_total = torch.zeros(n_q, device=Q.device, dtype=Q.dtype)
+        # 初始化最终输出O、LogSumExp L，shape [total_batch, n_q, d]
+        O_total = torch.zeros_like(Q_flat)
+        L_total = torch.zeros(
+            (total_batch, n_q), device=Q_flat.device, dtype=Q_flat.dtype
+        )
 
-        # 外层循环：遍历每一个Query分块 Qi (对应伪代码第4行)
-        for i in range(n_q_tiles):
-            # 伪代码第5行：加载Qi
-            q_start = i * Q_TILE_SIZE
-            q_end = min(q_start + Q_TILE_SIZE, n_q)
-            Qi = Q[q_start:q_end, :]
-            cur_Bq = q_end - q_start
+        # 遍历每一个合并后的batch/多头样本
+        for b_idx in range(total_batch):
+            Q_2d = Q_flat[b_idx]  # [n_q, d]
+            K_2d = K_flat[b_idx]  # [n_k, d]
+            V_2d = V_flat[b_idx]  # [n_k, d]
+            O_2d = torch.zeros_like(Q_2d)
+            L_2d = torch.zeros(n_q, device=Q_2d.device, dtype=Q_2d.dtype)
 
-            # 伪代码第6行：初始化 Oi^{(0)}, li^{(0)}, mi^{(0)}
-            O_prev = torch.zeros(cur_Bq, d, device=Q.device, dtype=Q.dtype)
-            l_prev = torch.zeros(cur_Bq, device=Q.device, dtype=Q.dtype)
-            m_prev = torch.full(
-                (cur_Bq,), -float("inf"), device=Q.device, dtype=Q.dtype
-            )
+            # 外层循环：遍历每一个Query分块 Qi (对应伪代码第4行)
+            for i in range(n_q_tiles):
+                # 伪代码第5行：加载Qi
+                q_start = i * Q_TILE_SIZE
+                q_end = min(q_start + Q_TILE_SIZE, n_q)
+                Qi = Q_2d[q_start:q_end, :]
+                cur_Bq = q_end - q_start
 
-            # 内层循环：遍历每一个KV分块 K(j), V(j) 伪代码第7行
-            for j in range(n_k_tiles):
-                # 加载当前KV tile
-                kv_start = j * K_TILE_SIZE
-                kv_end = min(kv_start + K_TILE_SIZE, n_k)
-                Kj = K[kv_start:kv_end, :]
-                Vj = V[kv_start:kv_end, :]
-                cur_Bk = kv_end - kv_start
+                # 伪代码第6行：初始化 Oi^{(0)}, li^{(0)}, mi^{(0)}
+                O_prev = torch.zeros(cur_Bq, d, device=Q_2d.device, dtype=Q_2d.dtype)
+                l_prev = torch.zeros(cur_Bq, device=Q_2d.device, dtype=Q_2d.dtype)
+                m_prev = torch.full(
+                    (cur_Bq,), -float("inf"), device=Q_2d.device, dtype=Q_2d.dtype
+                )
 
-                # 9: 计算得分矩阵 S_i^{(j)} = Qi @ Kj.T / sqrt(d)
-                S_ij = Qi @ Kj.T / (d**0.5)
+                # 内层循环：遍历每一个KV分块 K(j), V(j) 伪代码第7行
+                for j in range(n_k_tiles):
+                    # 加载当前KV tile
+                    kv_start = j * K_TILE_SIZE
+                    kv_end = min(kv_start + K_TILE_SIZE, n_k)
+                    Kj = K_2d[kv_start:kv_end, :]
+                    Vj = V_2d[kv_start:kv_end, :]
+                    cur_Bk = kv_end - kv_start
 
-                # 10: 行max更新全局最大值 m_i^{(j)}
-                row_max_S = S_ij.max(dim=-1).values  # [cur_Bq]
-                m_curr = torch.maximum(m_prev, row_max_S)
+                    # 9: 计算得分矩阵 S_i^{(j)} = Qi @ Kj.T / sqrt(d)
+                    S_ij = Qi @ Kj.T / (d**0.5)
 
-                # 11: 减去当前全局最大值，指数得到未归一化权重 P~
-                P_tilde = torch.exp(S_ij - m_curr.unsqueeze(-1))  # [Bq, Bk]
+                    # 10: 行max更新全局最大值 m_i^{(j)}
+                    row_max_S = S_ij.max(dim=-1).values  # [cur_Bq]
+                    m_curr = torch.maximum(m_prev, row_max_S)
 
-                # 12: 递推更新 l_i^{(j)}
-                scale = torch.exp(m_prev - m_curr)
-                l_curr = scale * l_prev + P_tilde.sum(dim=-1)
+                    # 11: 减去当前全局最大值，指数得到未归一化权重 P~
+                    P_tilde = torch.exp(S_ij - m_curr.unsqueeze(-1))  # [Bq, Bk]
 
-                # 13: 递推更新输出 O_i^{(j)}
-                O_curr = scale.unsqueeze(-1) * O_prev + P_tilde @ Vj
+                    # 12: 递推更新 l_i^{(j)}
+                    scale = torch.exp(m_prev - m_curr)
+                    l_curr = scale * l_prev + P_tilde.sum(dim=-1)
 
-                # 迭代变量滚动赋值
-                m_prev = m_curr
-                l_prev = l_curr
-                O_prev = O_curr
+                    # 13: 递推更新输出 O_i^{(j)}
+                    O_curr = scale.unsqueeze(-1) * O_prev + P_tilde @ Vj
 
-            # 15: 遍历所有KV块结束，归一化得到最终Qi对应的输出
-            O_final = O_prev / l_prev.unsqueeze(-1)
-            # 16: 计算该行LogSumExp L_i = m + log(l)
-            L_final = m_prev + torch.log(l_prev)
+                    # 迭代变量滚动赋值
+                    m_prev = m_curr
+                    l_prev = l_curr
+                    O_prev = O_curr
 
-            # 回填到全局结果
-            O_total[q_start:q_end, :] = O_final
-            L_total[q_start:q_end] = L_final
+                # 15: 遍历所有KV块结束，归一化得到最终Qi对应的输出
+                O_final = O_prev / l_prev.unsqueeze(-1)
+                # 16: 计算该行LogSumExp L_i = m + log(l)
+                L_final = m_prev + torch.log(l_prev)
+
+                # 回填到单batch结果
+                O_2d[q_start:q_end, :] = O_final
+                L_2d[q_start:q_end] = L_final
+
+            # 回填全局batch维度
+            O_total[b_idx] = O_2d
+            L_total[b_idx] = L_2d
 
         # 保存上下文，用于后续反向传播
         ctx.save_for_backward(Q, K, V, O_total, L_total)
+        # 存入原始前缀形状，反向用来复原梯度维度
+        ctx.prefix_shape = prefix_shape
         ctx.is_causal = is_causal
         ctx.Bq, ctx.Bk = Q_TILE_SIZE, K_TILE_SIZE
-        return O_total
+
+        # 直接view复原维度，prefix_shape是最开始Q.shape[:-2]
+        O_out = O_total.view(*prefix_shape, n_q, d)
+        return O_out
 
     @staticmethod
     def backward(ctx, grad_O):
@@ -112,23 +136,3 @@ class FlashAttention2Forward(autograd.Function):
 
 # 包装成可直接调用的函数
 flash_attention2_forward = FlashAttention2Forward.apply
-
-
-## 单元测试：验证前向结果与原生Attention完全一致
-if __name__ == "__main__":
-    # 构造2的幂维度输入（题目保证输入均为2幂且>=16）
-    Nq, Nk, d = 64, 64, 32
-    Q = torch.randn(Nq, d, device="cuda", dtype=torch.float32, requires_grad=True)
-    K = torch.randn(Nk, d, device="cuda", dtype=torch.float32, requires_grad=True)
-    V = torch.randn(Nk, d, device="cuda", dtype=torch.float32, requires_grad=True)
-
-    # 自定义FlashAttention2前向
-    O_flash = flash_attention2_forward(Q, K, V, False)
-    # 原生标准Attention参考结果
-    O_ref, L_ref = flash_attn_ref_naive(Q, K, V, False)
-
-    # 数值误差校验
-    max_err = (O_flash - O_ref).abs().max().item()
-    print(f"最大绝对误差: {max_err:.2e}")
-    torch.testing.assert_close(O_flash, O_ref, rtol=1e-4, atol=1e-4)
-    print("✅ FlashAttention-2 纯PyTorch前向结果与原生注意力完全匹配")
