@@ -217,7 +217,7 @@ def flash_fwd_kernel(
 
 
 @triton.jit
-def load_kv_related(
+def load_kv_related_bwd(
     K_ptr,
     V_ptr,
     batch_idx,
@@ -279,7 +279,7 @@ def load_kv_related(
 
 
 @triton.jit
-def load_q_related(
+def load_q_related_bwd(
     Q_ptr,
     O_ptr,
     dO_ptr,
@@ -419,7 +419,7 @@ def flash_bwd_kernel(
         q_start = q_tile_idx * Q_TILE_SIZE
 
         # 加载 Q, O, dO, L
-        Q, O, dO, L = load_q_related(
+        Q, O, dO, L = load_q_related_bwd(
             Q_ptr,
             O_ptr,
             dO_ptr,
@@ -450,7 +450,7 @@ def flash_bwd_kernel(
             kv_start = j * K_TILE_SIZE
 
             # 加载 K, V
-            K, V = load_kv_related(
+            K, V = load_kv_related_bwd(
                 K_ptr,
                 V_ptr,
                 batch_idx,
@@ -495,7 +495,7 @@ def flash_bwd_kernel(
         kv_start = kv_tile_idx * K_TILE_SIZE
 
         # 加载 K, V（外循环唯一一次）
-        K, V = load_kv_related(
+        K, V = load_kv_related_bwd(
             K_ptr,
             V_ptr,
             batch_idx,
@@ -519,7 +519,7 @@ def flash_bwd_kernel(
             q_start = j * Q_TILE_SIZE
 
             # 加载 Q, O, dO, L（内循环每次重加载）
-            Q, O, dO, L = load_q_related(
+            Q, O, dO, L = load_q_related_bwd(
                 Q_ptr,
                 O_ptr,
                 dO_ptr,
