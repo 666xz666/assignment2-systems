@@ -29,7 +29,7 @@ def flash_fwd_kernel(
     N_QUERIES,
     N_KEYS,
     scale,  # 1 / tl.sqrt(D)
-    D: tl.constexpr,
+    d: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
@@ -74,7 +74,7 @@ def flash_fwd_kernel(
         N_KEYS: 单样本 Key 序列长度
         scale: 注意力打分缩放系数 $1/\sqrt{D}$
 
-        D: 头维度，编译期常量
+        d: 头维度，编译期常量
         Q_TILE_SIZE: 单次迭代处理的 Query 行数
         K_TILE_SIZE: 单次迭代处理的 Key 行数
         is_causal: 是否开启因果掩码（自回归单向注意力），编译期常量
@@ -84,17 +84,17 @@ def flash_fwd_kernel(
     """
     # ====================== 1. 程序并行索引 ======================
     # 0维：切分 query 分块；1维：遍历 batch
-    query_tile_index = tl.program_id(0)
-    batch_index = tl.program_id(1)
+    batch_index = tl.program_id(0)
+    query_tile_index = tl.program_id(1)
 
     # ====================== 2. 加载 Query Tile（常驻 SMEM） ======================
     # Q 按列优先加载，提升访存合并效率，单次加载常驻片上内存
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_index * stride_qb,
-        shape=(N_QUERIES, D),
+        shape=(N_QUERIES, d),
         strides=(stride_qq, stride_qd),
         offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
+        block_shape=(Q_TILE_SIZE, d),
         order=(1, 0),
     )
     # 越界补0保证访存安全，末尾不完整tile无非法内存访问
@@ -104,32 +104,32 @@ def flash_fwd_kernel(
     # K/V 从序列起始位置开始，逐块向后滑动遍历所有 key
     K_block_ptr = tl.make_block_ptr(
         K_ptr + batch_index * stride_kb,
-        shape=(N_KEYS, D),
+        shape=(N_KEYS, d),
         strides=(stride_kk, stride_kd),
         offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
+        block_shape=(K_TILE_SIZE, d),
         order=(1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
         V_ptr + batch_index * stride_vb,
-        shape=(N_KEYS, D),
+        shape=(N_KEYS, d),
         strides=(stride_vk, stride_vd),
         offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
+        block_shape=(K_TILE_SIZE, d),
         order=(1, 0),
     )
 
     # ====================== 4. 输出结果写回指针初始化 ======================
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_ob,
-        shape=(N_QUERIES, D),
+        shape=(N_QUERIES, d),
         strides=(stride_oq, stride_od),
         offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
+        block_shape=(Q_TILE_SIZE, d),
         order=(1, 0),
     )
     # 初始化输出累加缓冲区
-    O = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    O = tl.zeros((Q_TILE_SIZE, d), dtype=tl.float32)
 
     # ====================== 5. LogSumExp 输出指针初始化 ======================
     L_block_ptr = tl.make_block_ptr(
@@ -216,6 +216,373 @@ def flash_fwd_kernel(
     tl.store(L_block_ptr, L, boundary_check=(0,))
 
 
+@triton.jit
+def load_kv_related(
+    K_ptr,
+    V_ptr,
+    batch_idx,
+    kv_start,
+    stride_kb,
+    stride_kk,
+    stride_kd,
+    stride_vb,
+    stride_vk,
+    stride_vd,
+    N_KEYS,
+    d: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    """
+    加载当前 KV tile 的 K 和 V 矩阵块。
+
+    参数：
+        K_ptr, V_ptr      : K 和 V 的全局指针（已包含 batch 偏移）
+        batch_idx         : 当前 batch 索引
+        kv_start          : 当前 KV tile 的起始行索引
+        stride_kb, ...    : K 的步长（batch, query, dim）
+        stride_vb, ...    : V 的步长
+        N_KEYS            : key 总数（用于边界检查）
+        d                 : 隐藏维度（编译时常量）
+        K_TILE_SIZE       : tile 行大小（编译时常量）
+    返回：
+        K, V : 两个形状为 (K_TILE_SIZE, d) 的张量
+    """
+    # ----- K 加载 -----
+    K = tl.load(
+        tl.make_block_ptr(
+            base=K_ptr + batch_idx * stride_kb,
+            shape=(N_KEYS, d),
+            strides=(stride_kk, stride_kd),
+            offsets=(kv_start, 0),
+            block_shape=(K_TILE_SIZE, d),
+            order=(1, 0),  # 列主序，兼容行连续存储
+        ),
+        boundary_check=(0, 1),  # 检查行和列边界
+        padding_option="zero",  # 越界填充零
+    )
+
+    # ----- V 加载 -----
+    V = tl.load(
+        tl.make_block_ptr(
+            base=V_ptr + batch_idx * stride_vb,
+            shape=(N_KEYS, d),
+            strides=(stride_vk, stride_vd),
+            offsets=(kv_start, 0),
+            block_shape=(K_TILE_SIZE, d),
+            order=(1, 0),
+        ),
+        boundary_check=(0, 1),
+        padding_option="zero",
+    )
+
+    return K, V
+
+
+@triton.jit
+def load_q_related(
+    Q_ptr,
+    O_ptr,
+    dO_ptr,
+    L_ptr,
+    batch_idx,
+    q_start,
+    stride_qb,
+    stride_qq,
+    stride_qd,
+    stride_ob,
+    stride_oq,
+    stride_od,
+    stride_dob,
+    stride_doq,
+    stride_dod,
+    stride_lb,
+    stride_lq,
+    N_QUERIES,
+    d: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+):
+    """
+    加载当前 Q tile 对应的 Q, O, dO, L 矩阵/向量块。
+    返回四个张量：Q (Q_TILE_SIZE, d), O (Q_TILE_SIZE, d),
+                  dO (Q_TILE_SIZE, d), L (Q_TILE_SIZE,)
+    """
+    # ----- Q 加载 -----
+    Q = tl.load(
+        tl.make_block_ptr(
+            base=Q_ptr + batch_idx * stride_qb,
+            shape=(N_QUERIES, d),
+            strides=(stride_qq, stride_qd),
+            offsets=(q_start, 0),
+            block_shape=(Q_TILE_SIZE, d),
+            order=(1, 0),
+        ),
+        boundary_check=(0, 1),
+        padding_option="zero",
+    )
+
+    # ----- O 加载 -----
+    O = tl.load(
+        tl.make_block_ptr(
+            base=O_ptr + batch_idx * stride_ob,
+            shape=(N_QUERIES, d),
+            strides=(stride_oq, stride_od),
+            offsets=(q_start, 0),
+            block_shape=(Q_TILE_SIZE, d),
+            order=(1, 0),
+        ),
+        boundary_check=(0, 1),
+        padding_option="zero",
+    )
+
+    # ----- dO 加载 -----
+    dO = tl.load(
+        tl.make_block_ptr(
+            base=dO_ptr + batch_idx * stride_dob,
+            shape=(N_QUERIES, d),
+            strides=(stride_doq, stride_dod),
+            offsets=(q_start, 0),
+            block_shape=(Q_TILE_SIZE, d),
+            order=(1, 0),
+        ),
+        boundary_check=(0, 1),
+        padding_option="zero",
+    )
+
+    # ----- L 加载（一维向量） -----
+    L = tl.load(
+        tl.make_block_ptr(
+            base=L_ptr + batch_idx * stride_lb,
+            shape=(N_QUERIES,),  # 注意是一维
+            strides=(stride_lq,),
+            offsets=(q_start,),
+            block_shape=(Q_TILE_SIZE,),
+            order=(0,),  # 一维时 ordr 需为 (0,)
+        ),
+        boundary_check=(0,),  # 只检查行边界
+        padding_option="zero",
+    )
+
+    return Q, O, dO, L
+
+
+@triton.jit
+def flash_bwd_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    O_ptr,
+    L_ptr,
+    dO_ptr,
+    dQ_ptr,
+    dK_ptr,
+    dV_ptr,
+    stride_qb,
+    stride_qq,
+    stride_qd,
+    stride_kb,
+    stride_kk,
+    stride_kd,
+    stride_vb,
+    stride_vk,
+    stride_vd,
+    stride_ob,
+    stride_oq,
+    stride_od,
+    stride_lb,
+    stride_lq,
+    stride_dob,
+    stride_doq,
+    stride_dod,
+    stride_dqb,
+    stride_dqq,
+    stride_dqd,
+    stride_dkb,
+    stride_dkk,
+    stride_dkd,
+    stride_dvb,
+    stride_dvk,
+    stride_dvd,
+    N_QUERIES,
+    N_KEYS,
+    scale,
+    d: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
+    mode: tl.constexpr,
+    dtype: tl.constexpr = tl.float32,  # 新增：输出数据类型，应与 dO 一致
+):
+    batch_idx = tl.program_id(0)
+
+    if mode == "q":
+        q_tile_idx = tl.program_id(1)
+        q_start = q_tile_idx * Q_TILE_SIZE
+
+        # 加载 Q, O, dO, L
+        Q, O, dO, L = load_q_related(
+            Q_ptr,
+            O_ptr,
+            dO_ptr,
+            L_ptr,
+            batch_idx,
+            q_start,
+            stride_qb,
+            stride_qq,
+            stride_qd,
+            stride_ob,
+            stride_oq,
+            stride_od,
+            stride_dob,
+            stride_doq,
+            stride_dod,
+            stride_lb,
+            stride_lq,
+            N_QUERIES,
+            d,
+            Q_TILE_SIZE,
+        )
+
+        D = tl.sum(O * dO, axis=-1)
+        dQ = tl.zeros((Q_TILE_SIZE, d), dtype=tl.float32)
+        num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+
+        for j in range(num_k_tiles):
+            kv_start = j * K_TILE_SIZE
+
+            # 加载 K, V
+            K, V = load_kv_related(
+                K_ptr,
+                V_ptr,
+                batch_idx,
+                kv_start,
+                stride_kb,
+                stride_kk,
+                stride_kd,
+                stride_vb,
+                stride_vk,
+                stride_vd,
+                N_KEYS,
+                d,
+                K_TILE_SIZE,
+            )
+
+            S = tl.dot(Q, tl.trans(K)) * scale
+            if is_causal:
+                q_idx = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]
+                k_idx = kv_start + tl.arange(0, K_TILE_SIZE)[None, :]
+                S = tl.where(q_idx >= k_idx, S, -float("inf"))
+            P = tl.exp(S - L[:, None])
+            dP = tl.dot(dO, tl.trans(V))
+            dS = P * (dP - D[:, None])
+            dQ = tl.dot(dS * scale, K, acc=dQ)
+
+        # 循环外写入 dQ
+        tl.store(
+            tl.make_block_ptr(
+                base=dQ_ptr + batch_idx * stride_dqb,
+                shape=(N_QUERIES, d),
+                strides=(stride_dqq, stride_dqd),
+                offsets=(q_start, 0),
+                block_shape=(Q_TILE_SIZE, d),
+                order=(1, 0),
+            ),
+            dQ.to(dtype),
+            boundary_check=(0, 1),
+        )
+
+    elif mode == "kv":
+        kv_tile_idx = tl.program_id(1)
+        kv_start = kv_tile_idx * K_TILE_SIZE
+
+        # 加载 K, V（外循环唯一一次）
+        K, V = load_kv_related(
+            K_ptr,
+            V_ptr,
+            batch_idx,
+            kv_start,
+            stride_kb,
+            stride_kk,
+            stride_kd,
+            stride_vb,
+            stride_vk,
+            stride_vd,
+            N_KEYS,
+            d,
+            K_TILE_SIZE,
+        )
+
+        dK = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
+        dV = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
+        num_q_tiles = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
+
+        for j in range(num_q_tiles):
+            q_start = j * Q_TILE_SIZE
+
+            # 加载 Q, O, dO, L（内循环每次重加载）
+            Q, O, dO, L = load_q_related(
+                Q_ptr,
+                O_ptr,
+                dO_ptr,
+                L_ptr,
+                batch_idx,
+                q_start,
+                stride_qb,
+                stride_qq,
+                stride_qd,
+                stride_ob,
+                stride_oq,
+                stride_od,
+                stride_dob,
+                stride_doq,
+                stride_dod,
+                stride_lb,
+                stride_lq,
+                N_QUERIES,
+                d,
+                Q_TILE_SIZE,
+            )
+
+            D = tl.sum(O * dO, axis=-1)
+
+            S = tl.dot(Q, tl.trans(K)) * scale
+            if is_causal:
+                q_idx = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]
+                k_idx = kv_start + tl.arange(0, K_TILE_SIZE)[None, :]
+                S = tl.where(q_idx >= k_idx, S, -float("inf"))
+            P = tl.exp(S - L[:, None])
+            dP = tl.dot(dO, tl.trans(V))
+            dS = P * (dP - D[:, None])
+
+            dK = tl.dot(tl.trans(dS) * scale, Q, acc=dK)
+            dV = tl.dot(tl.trans(P), dO, acc=dV)
+
+        # 循环外写入 dK, dV
+        tl.store(
+            tl.make_block_ptr(
+                base=dK_ptr + batch_idx * stride_dkb,
+                shape=(N_KEYS, d),
+                strides=(stride_dkk, stride_dkd),
+                offsets=(kv_start, 0),
+                block_shape=(K_TILE_SIZE, d),
+                order=(1, 0),
+            ),
+            dK.to(dtype),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            tl.make_block_ptr(
+                base=dV_ptr + batch_idx * stride_dvb,
+                shape=(N_KEYS, d),
+                strides=(stride_dvk, stride_dvd),
+                offsets=(kv_start, 0),
+                block_shape=(K_TILE_SIZE, d),
+                order=(1, 0),
+            ),
+            dV.to(dtype),
+            boundary_check=(0, 1),
+        )
+
+
 class FlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
@@ -272,10 +639,160 @@ class FlashAttention(torch.autograd.Function):
         ctx.n_querys = n_querys
         ctx.n_keys = n_keys
         ctx.head_dim = d
+        ctx.output_shape = output_shape
 
         O = O.view(*output_shape, n_querys, d)
         return O
 
     @staticmethod
-    def backward(ctx, *grad_outputs):
-        raise NotImplementedError
+    def backward(ctx, grad_O):
+        # 取出前向保存的张量与超参
+        Q, K, V, O, L = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        Q_TILE_SIZE = ctx.Q_TILE_SIZE
+        K_TILE_SIZE = ctx.K_TILE_SIZE
+        n_querys = ctx.n_querys
+        n_keys = ctx.n_keys
+        d = ctx.head_dim
+        output_shape = ctx.output_shape
+
+        # 1. 把上游梯度 展平成和前向一致的 (bh, nq, d)
+        grad_O_flat = rearrange(grad_O, "... nq d -> (...) nq d")
+        bh = grad_O_flat.shape[0]
+
+        # 2. 初始化三个梯度张量，和输入同形状
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+
+        # 3. 构建反向网格 和前向完全一致 (q_tile_num, batch_head)
+        scale = 1.0 / math.sqrt(d)
+
+        # 调用 Triton 反向kernel，按签名顺序填入所有指针+stride+常量
+        flash_bwd_kernel[(bh, triton.cdiv(n_querys, Q_TILE_SIZE))](
+            # 只读输入指针
+            Q,
+            K,
+            V,
+            O,
+            L,
+            grad_O_flat,
+            # 输出梯度指针
+            dQ,
+            dK,
+            dV,
+            # Q stride
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+            # K stride
+            K.stride(0),
+            K.stride(1),
+            K.stride(2),
+            # V stride
+            V.stride(0),
+            V.stride(1),
+            V.stride(2),
+            # O stride
+            O.stride(0),
+            O.stride(1),
+            O.stride(2),
+            # L stride
+            L.stride(0),
+            L.stride(1),
+            # dO stride
+            grad_O_flat.stride(0),
+            grad_O_flat.stride(1),
+            grad_O_flat.stride(2),
+            # dQ stride
+            dQ.stride(0),
+            dQ.stride(1),
+            dQ.stride(2),
+            # dK stride
+            dK.stride(0),
+            dK.stride(1),
+            dK.stride(2),
+            # dV stride
+            dV.stride(0),
+            dV.stride(1),
+            dV.stride(2),
+            # 形状常量
+            n_querys,
+            n_keys,
+            scale,
+            d,
+            # tile常量
+            Q_TILE_SIZE,
+            K_TILE_SIZE,
+            # 因果标记
+            is_causal,
+            mode="q",
+        )
+        flash_bwd_kernel[(bh, triton.cdiv(n_keys, K_TILE_SIZE))](
+            # 只读输入指针
+            Q,
+            K,
+            V,
+            O,
+            L,
+            grad_O_flat,
+            # 输出梯度指针
+            dQ,
+            dK,
+            dV,
+            # Q stride
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+            # K stride
+            K.stride(0),
+            K.stride(1),
+            K.stride(2),
+            # V stride
+            V.stride(0),
+            V.stride(1),
+            V.stride(2),
+            # O stride
+            O.stride(0),
+            O.stride(1),
+            O.stride(2),
+            # L stride
+            L.stride(0),
+            L.stride(1),
+            # dO stride
+            grad_O_flat.stride(0),
+            grad_O_flat.stride(1),
+            grad_O_flat.stride(2),
+            # dQ stride
+            dQ.stride(0),
+            dQ.stride(1),
+            dQ.stride(2),
+            # dK stride
+            dK.stride(0),
+            dK.stride(1),
+            dK.stride(2),
+            # dV stride
+            dV.stride(0),
+            dV.stride(1),
+            dV.stride(2),
+            # 形状常量
+            n_querys,
+            n_keys,
+            scale,
+            d,
+            # tile常量
+            Q_TILE_SIZE,
+            K_TILE_SIZE,
+            # 因果标记
+            is_causal,
+            mode="kv",
+        )
+
+        # 4. 将展平梯度还原回原始前缀维度
+        dQ = dQ.view(*output_shape, n_querys, d)
+        dK = dK.view(*output_shape, n_keys, d)
+        dV = dV.view(*output_shape, n_keys, d)
+
+        # forward 入参顺序: Q, K, V, is_causal
+        # is_causal 是布尔常量无梯度，返回None占位
+        return dQ, dK, dV, None

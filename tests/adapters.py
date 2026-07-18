@@ -14,7 +14,7 @@ def get_flashattention_autograd_function_pytorch() -> type:
         A class object (not an instance of the class)
     """
     # For example: return MyFlashAttnAutogradFunctionClass
-    from cs336_systems.torch.flash_forward import FlashAttention2Forward
+    from cs336_systems.torch.flashattention2 import FlashAttention2Forward
     return FlashAttention2Forward
 
 
