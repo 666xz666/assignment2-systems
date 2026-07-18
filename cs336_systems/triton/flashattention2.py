@@ -410,7 +410,6 @@ def flash_bwd_kernel(
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
     mode: tl.constexpr,
-    out_type: tl.constexpr = tl.float32,  # 新增：输出数据类型，应与 dO 一致
 ):
     batch_idx = tl.program_id(0)
 
@@ -477,15 +476,17 @@ def flash_bwd_kernel(
             dQ = tl.dot(dS * scale, K, acc=dQ)
 
         # 循环外写入 dQ
+        dQ_block_ptr = tl.make_block_ptr(
+            base=dQ_ptr + batch_idx * stride_dqb,
+            shape=(N_QUERIES, d),
+            strides=(stride_dqq, stride_dqd),
+            offsets=(q_start, 0),
+            block_shape=(Q_TILE_SIZE, d),
+            order=(1, 0),
+        )
+        out_type = dQ_block_ptr.type.element_ty
         tl.store(
-            tl.make_block_ptr(
-                base=dQ_ptr + batch_idx * stride_dqb,
-                shape=(N_QUERIES, d),
-                strides=(stride_dqq, stride_dqd),
-                offsets=(q_start, 0),
-                block_shape=(Q_TILE_SIZE, d),
-                order=(1, 0),
-            ),
+            dQ_block_ptr,
             dQ.to(out_type),
             boundary_check=(0, 1),
         )
@@ -557,15 +558,17 @@ def flash_bwd_kernel(
             dV = tl.dot(tl.trans(P), dO, acc=dV)
 
         # 循环外写入 dK, dV
+        dK_block_ptr = tl.make_block_ptr(
+            base=dK_ptr + batch_idx * stride_dkb,
+            shape=(N_KEYS, d),
+            strides=(stride_dkk, stride_dkd),
+            offsets=(kv_start, 0),
+            block_shape=(K_TILE_SIZE, d),
+            order=(1, 0),
+        )
+        out_type = dK_block_ptr.type.element_ty
         tl.store(
-            tl.make_block_ptr(
-                base=dK_ptr + batch_idx * stride_dkb,
-                shape=(N_KEYS, d),
-                strides=(stride_dkk, stride_dkd),
-                offsets=(kv_start, 0),
-                block_shape=(K_TILE_SIZE, d),
-                order=(1, 0),
-            ),
+            dK_block_ptr,
             dK.to(out_type),
             boundary_check=(0, 1),
         )
@@ -705,7 +708,6 @@ class FlashAttention(torch.autograd.Function):
                 K_TILE_SIZE=K_TILE_SIZE,
                 is_causal=is_causal,
                 mode=mode,
-                # dtype=dO.dtype,
             )
 
         # 5. 将展平梯度还原回原始前缀维度
