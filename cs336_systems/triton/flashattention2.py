@@ -411,6 +411,75 @@ def flash_bwd_kernel(
     is_causal: tl.constexpr,
     mode: tl.constexpr,
 ):
+    r"""
+    Triton 实现 FlashAttention 反向传播分块计算内核（单 kernel，双模式调度）。
+    根据 ``mode`` 参数分别计算 dQ（模式 ``"q"``）或 dK/dV（模式 ``"kv"``），
+    避免一次性加载全部 Q/K/V，减少寄存器压力并利用分块流水。
+    ## 反向传播数学原理
+    设前向 softmax 概率矩阵为
+
+    $$P = \exp\left( \frac{QK^\top}{\sqrt{D}} - \text{LSE} \right)$$
+    
+    其中 ``LSE`` 是前向存储的 log-sum-exp 归一化常数。
+    定义辅助向量
+    $$D = \sum_j O_{ij} \cdot dO_{ij} \quad \text{(逐行标量，} D \in \mathbb{R}^{B\times N_Q})$$
+    
+    则梯度计算公式如下（因果/注意力掩码仅影响 ``S`` 的计算域，不改变链式法则形式）：
+    $$dP = dO \cdot V^\top \qquad \text{(shape } [Q\_TILE\_SIZE, K\_TILE\_SIZE])$$
+
+    $$dS = P \cdot (dP - D) \qquad \text{(softmax 链式求导)}$$
+
+    $$dQ = \frac{1}{\sqrt{d}} \cdot dS \cdot K$$
+
+    $$dK = \frac{1}{\sqrt{d}} \cdot dS^\top \cdot Q$$
+    
+    $$dV = P^\top \cdot dO$$
+    
+    分块执行时：
+      - 模式 ``"q"``：对每个 Q-tile 遍历所有 K-tiles 累加 dQ；
+      - 模式 ``"kv"``：对每个 K-tile 遍历所有 Q-tiles 累加 dK 和 dV。
+    ## Args
+        Q_ptr / K_ptr / V_ptr / O_ptr / L_ptr: 前向计算得到的输入/输出张量指针，
+            形状分别为 [B, N_QUERIES, D], [B, N_KEYS, D], [B, N_KEYS, D],
+            [B, N_QUERIES, D], [B, N_QUERIES]。
+        dO_ptr: 上游输出梯度指针，shape [B, N_QUERIES, D]。
+        dQ_ptr / dK_ptr / dV_ptr: 待写入的梯度输出指针，形状与对应输入完全相同。
+        stride_qb / qq / qd: Q 在 batch / query / feature 维度的步长。
+        stride_kb / kk / kd: K 的步长。
+        stride_vb / vk / vd: V 的步长。
+        stride_ob / oq / od: O 的步长。
+        stride_lb / lq: L（LogSumExp）的步长。
+        stride_dob / doq / dod: dO 的步长。
+        stride_dqb / dqq / dqd: dQ 的步长。
+        stride_dkb / dkk / dkd: dK 的步长。
+        stride_dvb / dvk / dvd: dV 的步长。
+        N_QUERIES: 单样本 Query 序列长度。
+        N_KEYS: 单样本 Key 序列长度。
+        scale: 注意力缩放系数 $1/\sqrt{D}$。
+        d: 头维度，编译期常量。
+        Q_TILE_SIZE: 单次处理的 Query 行数（编译期常量）。
+        K_TILE_SIZE: 单次处理的 Key 行数（编译期常量）。
+        is_causal: 是否启用因果掩码（自回归单向注意力），编译期常量。
+        mode: 当前 kernel 实例的调度模式，取 ``"q"`` 或 ``"kv"``（编译期常量）。
+            - ``"q"``: 程序 ID(1) 表示 Q-tile 索引，遍历所有 K-tiles 累加 dQ；
+            - ``"kv"``: 程序 ID(1) 表示 K-tile 索引，遍历所有 Q-tiles 累加 dK 和 dV。
+    ## 分块算法说明
+        - **模式 ``"q"``**:
+            1. 加载当前的 Q-tile（及其对应的 O, dO, L）。
+            2. 计算常数 ``D = sum(O * dO, axis=-1)``。
+            3. 循环 K-tiles，每次加载 K, V；计算当前块的 S, P, dP, dS；
+               用 ``tl.dot(dS * scale, K, acc=dQ)`` 累加 dQ。
+            4. 循环结束后将 dQ 写回全局内存。
+        - **模式 ``"kv"``**:
+            1. 加载当前的 K-tile 和 V-tile（仅一次，外循环）。
+            2. 循环 Q-tiles，每次加载 Q, O, dO, L；计算当前块的 S, P, dP, dS；
+               用 ``tl.dot(dS^T * scale, Q, acc=dK)`` 和 ``tl.dot(P^T, dO, acc=dV)`` 累加。
+            3. 循环结束后将 dK, dV 写回。
+        两种模式独立调度，通过不同的网格尺寸（分别以 Q-tile 数或 K-tile 数为第二维）
+        实现并行覆盖整个序列。
+    ## Returns
+        无返回值，通过传入的 dQ_ptr, dK_ptr, dV_ptr 指针原地写入对应梯度。
+    """
     batch_idx = tl.program_id(0)
 
     if mode == "q":
