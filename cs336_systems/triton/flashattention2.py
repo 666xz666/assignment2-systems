@@ -235,7 +235,7 @@ def load_kv_related_bwd(
     """
     加载当前 KV tile 的 K 和 V 矩阵块。
 
-    参数：
+    Args:
         K_ptr, V_ptr      : K 和 V 的全局指针（已包含 batch 偏移）
         batch_idx         : 当前 batch 索引
         kv_start          : 当前 KV tile 的起始行索引
@@ -244,7 +244,7 @@ def load_kv_related_bwd(
         N_KEYS            : key 总数（用于边界检查）
         d                 : 隐藏维度（编译时常量）
         K_TILE_SIZE       : tile 行大小（编译时常量）
-    返回：
+    Returns:
         K, V : 两个形状为 (K_TILE_SIZE, d) 的张量
     """
     # ----- K 加载 -----
@@ -410,7 +410,7 @@ def flash_bwd_kernel(
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
     mode: tl.constexpr,
-    dtype: tl.constexpr = tl.float32,  # 新增：输出数据类型，应与 dO 一致
+    out_type: tl.constexpr = tl.float32,  # 新增：输出数据类型，应与 dO 一致
 ):
     batch_idx = tl.program_id(0)
 
@@ -486,7 +486,7 @@ def flash_bwd_kernel(
                 block_shape=(Q_TILE_SIZE, d),
                 order=(1, 0),
             ),
-            dQ.to(dtype),
+            dQ.to(out_type),
             boundary_check=(0, 1),
         )
 
@@ -566,7 +566,7 @@ def flash_bwd_kernel(
                 block_shape=(K_TILE_SIZE, d),
                 order=(1, 0),
             ),
-            dK.to(dtype),
+            dK.to(out_type),
             boundary_check=(0, 1),
         )
         tl.store(
@@ -578,7 +578,7 @@ def flash_bwd_kernel(
                 block_shape=(K_TILE_SIZE, d),
                 order=(1, 0),
             ),
-            dV.to(dtype),
+            dV.to(out_type),
             boundary_check=(0, 1),
         )
 
@@ -602,27 +602,24 @@ class FlashAttention(torch.autograd.Function):
         O = torch.empty_like(Q)
         L = torch.empty((bh, n_querys), device=Q.device, dtype=Q.dtype)
 
-        # 启动算子
-        flash_fwd_kernel[(triton.cdiv(n_querys, Q_TILE_SIZE), bh)](
+        ptrs = (
             Q,
             K,
             V,
             O,
             L,
-            Q.stride(0),
-            Q.stride(1),
-            Q.stride(2),
-            K.stride(0),
-            K.stride(1),
-            K.stride(2),
-            V.stride(0),
-            V.stride(1),
-            V.stride(2),
-            O.stride(0),
-            O.stride(1),
-            O.stride(2),
-            L.stride(0),
-            L.stride(1),
+        )
+        strides = (
+            *Q.stride(),
+            *K.stride(),
+            *V.stride(),
+            *O.stride(),
+            *L.stride(),
+        )
+        # 启动算子
+        flash_fwd_kernel[(triton.cdiv(n_querys, Q_TILE_SIZE), bh)](
+            *ptrs,
+            *strides,
             n_querys,
             n_keys,
             1 / math.sqrt(d),
@@ -657,8 +654,8 @@ class FlashAttention(torch.autograd.Function):
         output_shape = ctx.output_shape
 
         # 1. 把上游梯度 展平成和前向一致的 (bh, nq, d)
-        grad_O_flat = rearrange(grad_O, "... nq d -> (...) nq d")
-        bh = grad_O_flat.shape[0]
+        dO = rearrange(grad_O, "... nq d -> (...) nq d")
+        bh = dO.shape[0]
 
         # 2. 初始化三个梯度张量，和输入同形状
         dQ = torch.zeros_like(Q)
@@ -668,127 +665,50 @@ class FlashAttention(torch.autograd.Function):
         # 3. 构建反向网格 和前向完全一致 (q_tile_num, batch_head)
         scale = 1.0 / math.sqrt(d)
 
-        # 调用 Triton 反向kernel，按签名顺序填入所有指针+stride+常量
-        flash_bwd_kernel[(bh, triton.cdiv(n_querys, Q_TILE_SIZE))](
-            # 只读输入指针
+        # 4. 调用 Triton 反向kernel，按签名顺序填入所有指针+stride+常量
+        ptrs = (
             Q,
             K,
             V,
             O,
             L,
-            grad_O_flat,
-            # 输出梯度指针
+            dO,
             dQ,
             dK,
             dV,
-            # Q stride
-            Q.stride(0),
-            Q.stride(1),
-            Q.stride(2),
-            # K stride
-            K.stride(0),
-            K.stride(1),
-            K.stride(2),
-            # V stride
-            V.stride(0),
-            V.stride(1),
-            V.stride(2),
-            # O stride
-            O.stride(0),
-            O.stride(1),
-            O.stride(2),
-            # L stride
-            L.stride(0),
-            L.stride(1),
-            # dO stride
-            grad_O_flat.stride(0),
-            grad_O_flat.stride(1),
-            grad_O_flat.stride(2),
-            # dQ stride
-            dQ.stride(0),
-            dQ.stride(1),
-            dQ.stride(2),
-            # dK stride
-            dK.stride(0),
-            dK.stride(1),
-            dK.stride(2),
-            # dV stride
-            dV.stride(0),
-            dV.stride(1),
-            dV.stride(2),
-            # 形状常量
-            n_querys,
-            n_keys,
-            scale,
-            d,
-            # tile常量
-            Q_TILE_SIZE,
-            K_TILE_SIZE,
-            # 因果标记
-            is_causal,
-            mode="q",
         )
-        flash_bwd_kernel[(bh, triton.cdiv(n_keys, K_TILE_SIZE))](
-            # 只读输入指针
-            Q,
-            K,
-            V,
-            O,
-            L,
-            grad_O_flat,
-            # 输出梯度指针
-            dQ,
-            dK,
-            dV,
-            # Q stride
-            Q.stride(0),
-            Q.stride(1),
-            Q.stride(2),
-            # K stride
-            K.stride(0),
-            K.stride(1),
-            K.stride(2),
-            # V stride
-            V.stride(0),
-            V.stride(1),
-            V.stride(2),
-            # O stride
-            O.stride(0),
-            O.stride(1),
-            O.stride(2),
-            # L stride
-            L.stride(0),
-            L.stride(1),
-            # dO stride
-            grad_O_flat.stride(0),
-            grad_O_flat.stride(1),
-            grad_O_flat.stride(2),
-            # dQ stride
-            dQ.stride(0),
-            dQ.stride(1),
-            dQ.stride(2),
-            # dK stride
-            dK.stride(0),
-            dK.stride(1),
-            dK.stride(2),
-            # dV stride
-            dV.stride(0),
-            dV.stride(1),
-            dV.stride(2),
-            # 形状常量
-            n_querys,
-            n_keys,
-            scale,
-            d,
-            # tile常量
-            Q_TILE_SIZE,
-            K_TILE_SIZE,
-            # 因果标记
-            is_causal,
-            mode="kv",
+        strides = (
+            *Q.stride(),
+            *K.stride(),
+            *V.stride(),
+            *O.stride(),
+            *L.stride(),
+            *dO.stride(),
+            *dQ.stride(),
+            *dK.stride(),
+            *dV.stride(),
         )
+        modes = ("q", "kv")
+        grids = (
+            (bh, triton.cdiv(n_querys, Q_TILE_SIZE)),
+            (bh, triton.cdiv(n_keys, K_TILE_SIZE)),
+        )
+        for mode, grid in zip(modes, grids):
+            flash_bwd_kernel[grid](
+                *ptrs,
+                *strides,
+                n_querys,
+                n_keys,
+                scale,
+                d=d,
+                Q_TILE_SIZE=Q_TILE_SIZE,
+                K_TILE_SIZE=K_TILE_SIZE,
+                is_causal=is_causal,
+                mode=mode,
+                # dtype=dO.dtype,
+            )
 
-        # 4. 将展平梯度还原回原始前缀维度
+        # 5. 将展平梯度还原回原始前缀维度
         dQ = dQ.view(*output_shape, n_querys, d)
         dK = dK.view(*output_shape, n_keys, d)
         dV = dV.view(*output_shape, n_keys, d)
