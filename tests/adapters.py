@@ -144,4 +144,6 @@ def get_sharded_optimizer(
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    from cs336_systems.ddp.shared_optimizer import ShardedOptimizer
+
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)
