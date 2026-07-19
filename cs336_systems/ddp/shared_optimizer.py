@@ -1,6 +1,6 @@
 import torch
 import torch.distributed as dist
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, Type
 
 
 class ShardedOptimizer(torch.optim.Optimizer):
@@ -8,16 +8,17 @@ class ShardedOptimizer(torch.optim.Optimizer):
     优化器状态分片包装器。
     每个 rank 仅维护自己负责的那部分参数的优化器状态，并在每次 step() 后通过 broadcast
     同步所有参数，使得所有 rank 持有完整的模型参数。
-
-    参数：
-        params: 一个可迭代对象，包含要优化的参数（或参数组字典的列表）。
-        optimizer_cls: 要包装的优化器类，例如 torch.optim.AdamW。
-        **kwargs: 传给 optimizer_cls 构造函数的其他关键字参数（如 lr, weight_decay 等）。
     """
 
     def __init__(
         self, params, optimizer_cls: Type[torch.optim.Optimizer], **kwargs: Any
     ):
+        """
+        Args：
+        params: 一个可迭代对象，包含要优化的参数（或参数组字典的列表）。
+        optimizer_cls: 要包装的优化器类，例如 torch.optim.AdamW。
+        **kwargs: 传给 optimizer_cls 构造函数的其他关键字参数（如 lr, weight_decay 等）。
+        """
         # 获取分布式信息
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.rank = dist.get_rank() if dist.is_initialized() else 0
