@@ -28,7 +28,7 @@ def _get_weight_name(module: nn.Module) -> str:
 
 
 def _shard_range(total_rows: int, rank: int, world_size: int) -> tuple[int, int]:
-    """Return [start, end) for an approximately even row-wise shard."""
+    """Return the [start, end) range for this rank's row-wise shard."""
     base, remainder = divmod(total_rows, world_size)
     start = rank * base + min(rank, remainder)
     size = base + (1 if rank < remainder else 0)
@@ -36,7 +36,7 @@ def _shard_range(total_rows: int, rank: int, world_size: int) -> tuple[int, int]
 
 
 def _pad_rows(tensor: torch.Tensor, target_rows: int) -> torch.Tensor:
-    """Pad only dimension zero to target_rows."""
+    """Pad dimension zero with zeros until it has target_rows rows."""
     pad_rows = target_rows - tensor.shape[0]
     if pad_rows < 0:
         raise ValueError("target_rows must be at least tensor.shape[0]")
@@ -53,7 +53,7 @@ def _pad_rows(tensor: torch.Tensor, target_rows: int) -> torch.Tensor:
 
 
 class GatherWeights(torch.autograd.Function):
-    """All-gather parameter shards in forward and reduce gradients in backward."""
+    """All-gather parameter shards in forward and average full gradients in backward."""
 
     @staticmethod
     def forward(
@@ -83,8 +83,8 @@ class GatherWeights(torch.autograd.Function):
 
         parts = []
         for source_rank, size in enumerate(shard_sizes):
-            block_start = source_rank * max_shard_size
-            parts.append(gathered_padded[block_start : block_start + size])
+            start = source_rank * max_shard_size
+            parts.append(gathered_padded[start : start + size])
         return torch.cat(parts, dim=0)
 
     @staticmethod
@@ -93,8 +93,14 @@ class GatherWeights(torch.autograd.Function):
         rank = ctx.rank
         world_size = len(shard_sizes)
 
+        # This collective is launched asynchronously, but must be completed here:
+        # autograd needs the final local shard gradient before backward can return.
         reduced_grad = grad_full.contiguous()
-        work = dist.all_reduce(reduced_grad, op=dist.ReduceOp.SUM, async_op=True)
+        work = dist.all_reduce(
+            reduced_grad,
+            op=dist.ReduceOp.SUM,
+            async_op=True,
+        )
         work.wait()
         reduced_grad.div_(world_size)
 
@@ -140,7 +146,7 @@ class _FSDPWeightModule(nn.Module):
 
     @torch.no_grad()
     def gather_weight(self) -> torch.Tensor:
-        """Synchronously reconstruct this module's complete weight."""
+        """Synchronously reconstruct this module's full weight."""
         shard = self.weight_shard.detach()
         padded_shard = _pad_rows(shard, self._max_size)
         gathered_padded = torch.empty(
@@ -239,7 +245,7 @@ class FSDP(nn.Module):
         self.compute_dtype = compute_dtype
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self._gradient_work_handles: list[object] = []
+        self._gradient_work_handles: list[tuple[object, torch.Tensor]] = []
 
         self._replace_layers(self.module)
         self._register_unsharded_gradient_hooks()
@@ -272,34 +278,47 @@ class FSDP(nn.Module):
                 self._replace_layers(child)
 
     def _register_unsharded_gradient_hooks(self) -> None:
+        """Synchronize replicated parameters such as biases and LayerNorm weights."""
         for parameter in self.module.parameters():
-            if not parameter.requires_grad or getattr(
-                parameter, "_fsdp_sharded", False
-            ):
+            if not parameter.requires_grad:
                 continue
-            parameter.register_hook(self._make_average_gradient_hook())
+            if getattr(parameter, "_fsdp_sharded", False):
+                continue
 
-    def _make_average_gradient_hook(self):
-        def hook(grad: torch.Tensor) -> torch.Tensor:
-            if grad is None or self.world_size == 1:
-                return grad
+            parameter.register_post_accumulate_grad_hook(
+                self._enqueue_unsharded_gradient_sync
+            )
 
-            synced_grad = grad.contiguous()
-            dist.all_reduce(synced_grad, op=dist.ReduceOp.AVG)
-            return synced_grad
+    def _enqueue_unsharded_gradient_sync(self, parameter: torch.Tensor) -> None:
+        """Start an asynchronous all-reduce for one replicated parameter gradient."""
+        if parameter.grad is None or self.world_size == 1:
+            return
 
-        return hook
+        grad = parameter.grad
+        if not grad.is_contiguous():
+            grad = grad.contiguous()
+            parameter.grad = grad
+
+        work = dist.all_reduce(
+            grad,
+            op=dist.ReduceOp.SUM,
+            async_op=True,
+        )
+        self._gradient_work_handles.append((work, grad))
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
 
     def finish_gradient_synchronization(self) -> None:
-        """Synchronize gradients before the optimizer step."""
+        """Wait for replicated-gradient reductions and convert sums to averages."""
+        for work, grad in self._gradient_work_handles:
+            work.wait()
+            grad.div_(self.world_size)
         self._gradient_work_handles.clear()
 
     @torch.no_grad()
     def gather_full_params(self) -> dict[str, torch.Tensor]:
-        """Return full parameter tensors using the original module parameter names."""
+        """Return full parameter tensors using original module parameter names."""
         full_params: dict[str, torch.Tensor] = {}
 
         for module_name, child in self.module.named_modules():
