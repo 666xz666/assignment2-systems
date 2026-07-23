@@ -24,7 +24,7 @@ class ToyFSDPModel(nn.Module):
 
     def __init__(self, vocab_size=100, d_model=64, d_ff=128):
         super().__init__()
-        from cs336_basics.model import Embedding, Linear, RMSNorm
+        from cs336_basics.nn import Embedding, Linear, RMSNorm
 
         self.embedding = Embedding(vocab_size, d_model)
         self.norm1 = RMSNorm(d_model)
@@ -50,7 +50,7 @@ def _apply_mixed_precision_hooks(model, compute_dtype):
     behavior: cast Linear/Embedding weights to compute_dtype for
     forward/backward, keep master weights and optimizer updates in fp32.
     """
-    from cs336_basics.model import Embedding, Linear
+    from cs336_basics.nn import Embedding, Linear
 
     for mod in model.modules():
         if not isinstance(mod, (Linear, Embedding)):
@@ -99,7 +99,9 @@ def _apply_mixed_precision_hooks(model, compute_dtype):
 
             return hook
 
-        mod.weight.register_post_accumulate_grad_hook(make_grad_hook(mod, isinstance(mod, Linear)))
+        mod.weight.register_post_accumulate_grad_hook(
+            make_grad_hook(mod, isinstance(mod, Linear))
+        )
 
 
 @pytest.mark.filterwarnings("error")
@@ -201,7 +203,7 @@ def test_fsdp_gradient_sync(compute_dtype):
 
 
 def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
-    from cs336_basics.model import Embedding, Linear
+    from cs336_basics.nn import Embedding, Linear
 
     torch.use_deterministic_algorithms(True)
     device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
@@ -228,16 +230,26 @@ def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
     for name, param in fsdp_model.module.named_parameters():
         if param.requires_grad:
             assert param.grad is not None, f"Gradient is None for {name}"
-            assert param.grad.shape == param.data.shape, f"Gradient shape {param.grad.shape} != data shape {param.data.shape} for {name}"
-            assert param.grad.dtype == param.data.dtype, f"Gradient dtype {param.grad.dtype} != data dtype {param.data.dtype} for {name}"
+            assert param.grad.shape == param.data.shape, (
+                f"Gradient shape {param.grad.shape} != data shape {param.data.shape} for {name}"
+            )
+            assert param.grad.dtype == param.data.dtype, (
+                f"Gradient dtype {param.grad.dtype} != data dtype {param.data.dtype} for {name}"
+            )
 
     # Replicated (non-FSDP) parameter gradients must be identical across ranks
     for name, param in fsdp_model.module.named_parameters():
         if not param.requires_grad:
             continue
         parts = name.rsplit(".", 1)
-        mod = dict(fsdp_model.module.named_modules())[parts[0]] if len(parts) == 2 else fsdp_model.module
-        if isinstance(mod, (Linear, Embedding)):
+        mod = (
+            dict(fsdp_model.module.named_modules())[parts[0]]
+            if len(parts) == 2
+            else fsdp_model.module
+        )
+        from cs336_systems.ddp.fsdp import FSDPLinear, FSDPEmbedding
+
+        if isinstance(mod, (FSDPLinear, FSDPEmbedding)):
             continue
         gathered = [torch.zeros_like(param.grad) for _ in range(world_size)]
         dist.all_gather(gathered, param.grad)

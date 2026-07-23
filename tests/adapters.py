@@ -92,7 +92,9 @@ def get_fsdp(
         Instance of an FSDP class.
     """
     # For example: return FSDP(module, compute_dtype=compute_dtype)
-    raise NotImplementedError
+    from cs336_systems.ddp.fsdp import FSDP
+
+    return FSDP(module, compute_dtype=compute_dtype)
 
 
 def fsdp_on_after_backward(
@@ -109,7 +111,7 @@ def fsdp_on_after_backward(
             Optimizer being used with the FSDP-wrapped model.
     """
     # For example: fsdp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    fsdp_model.finish_gradient_synchronization()
 
 
 def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -123,7 +125,7 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
     Returns:
         State dictionary mapping parameter names to full (unsharded) tensors.
     """
-    raise NotImplementedError
+    return fsdp_model.gather_full_params()
 
 
 def get_sharded_optimizer(
